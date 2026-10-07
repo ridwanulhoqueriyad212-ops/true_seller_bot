@@ -1,7 +1,5 @@
 import express from "express";
 import pino from "pino";
-import { Boom } from "@hapi/boom";
-
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
@@ -12,24 +10,22 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-
-const DB_URL =
-  process.env.FIREBASE_DB_URL ||
-  "https://true-seller-5f0e7-default-rtdb.firebaseio.com";
-
+const FIREBASE_DB_URL = (process.env.FIREBASE_DB_URL || "").replace(/\/$/, "");
 const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || "").replace(/\D/g, "");
 
 const logger = pino({
-  level: "info"
+  level: "silent"
 });
 
 let sock = null;
+let reconnecting = false;
 let pairingRequested = false;
 
+// Customer order states
 const orderStates = new Map();
 
 /* =========================
-   HTTP SERVER
+   EXPRESS SERVER
 ========================= */
 
 app.get("/", (req, res) => {
@@ -39,7 +35,8 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    whatsappConnected: !!sock
+    whatsapp: !!sock,
+    time: new Date().toISOString()
   });
 });
 
@@ -48,19 +45,78 @@ app.listen(PORT, () => {
 });
 
 /* =========================
-   HELPERS
+   FIREBASE HELPERS
+========================= */
+
+async function firebaseGet(path) {
+  if (!FIREBASE_DB_URL) {
+    throw new Error("FIREBASE_DB_URL is missing");
+  }
+
+  const response = await fetch(
+    `${FIREBASE_DB_URL}/${path}.json`
+  );
+
+  if (!response.ok) {
+    throw new Error(`Firebase GET failed: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
+async function firebasePost(path, data) {
+  if (!FIREBASE_DB_URL) {
+    throw new Error("FIREBASE_DB_URL is missing");
+  }
+
+  const response = await fetch(
+    `${FIREBASE_DB_URL}/${path}.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(data)
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Firebase POST failed: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
+/* =========================
+   TEXT HELPERS
 ========================= */
 
 function normalize(text = "") {
   return text
     .toLowerCase()
     .trim()
-    .replace(/[!?.,;:()[\]{}"'`~]/g, " ")
+    .replace(/[.,!?।]/g, " ")
     .replace(/\s+/g, " ");
 }
 
-function digitsOnly(text = "") {
-  return text.replace(/\D/g, "");
+function normalizeBanglish(text = "") {
+  return normalize(text)
+    .replace(/tshrt/g, "tshirt")
+    .replace(/t shirt/g, "tshirt")
+    .replace(/tee shirt/g, "tshirt")
+    .replace(/blak/g, "black")
+    .replace(/blk/g, "black")
+    .replace(/kalo/g, "black")
+    .replace(/shada/g, "white")
+    .replace(/sada/g, "white")
+    .replace(/lal/g, "red")
+    .replace(/nil/g, "blue")
+    .replace(/jamar/g, "shirt")
+    .replace(/jma/g, "shirt")
+    .replace(/dam/g, "price")
+    .replace(/koto/g, "price")
+    .replace(/ache nki/g, "available")
+    .replace(/ache naki/g, "available");
 }
 
 function levenshtein(a, b) {
@@ -91,216 +147,153 @@ function levenshtein(a, b) {
   return matrix[b.length][a.length];
 }
 
-function similarity(a, b) {
-  if (!a || !b) return 0;
+function productScore(query, product) {
+  const q = normalizeBanglish(query);
 
-  if (a === b) return 1;
+  const name = normalizeBanglish(product.name || "");
 
-  if (a.includes(b) || b.includes(a)) {
-    return 0.9;
+  if (!name) return 0;
+
+  if (name.includes(q) || q.includes(name)) {
+    return 100;
   }
 
-  const distance = levenshtein(a, b);
-  return 1 - distance / Math.max(a.length, b.length);
-}
+  const qWords = q.split(" ").filter(Boolean);
+  const nameWords = name.split(" ").filter(Boolean);
 
-/* =========================
-   BANGLA / BANGLISH NORMALIZE
-========================= */
+  let score = 0;
 
-function cleanProductText(text) {
-  return normalize(text)
-    .replace(/টি/g, " ")
-    .replace(/টা/g, " ")
-    .replace(/টি/g, " ")
-    .replace(/টা/g, " ")
-    .replace(/জামা/g, " tshirt ")
-    .replace(/টি শার্ট/g, " tshirt ")
-    .replace(/টি-শার্ট/g, " tshirt ")
-    .replace(/শার্ট/g, " shirt ")
-    .replace(/কালো/g, " black ")
-    .replace(/কালো/g, " black ")
-    .replace(/সাদা/g, " white ")
-    .replace(/লাল/g, " red ")
-    .replace(/নীল/g, " blue ")
-    .replace(/অর্ডার/g, " order ")
-    .replace(/দাম/g, " price ")
-    .replace(/মূল্য/g, " price ")
-    .replace(/কত/g, " price ")
-    .replace(/আছে/g, " available ")
-    .replace(/আছ/g, " available ")
-    .replace(/স্টক/g, " stock ")
-    .replace(/\btshrt\b/g, "tshirt")
-    .replace(/\btshirt\b/g, "tshirt")
-    .replace(/\btee\b/g, "tshirt")
-    .replace(/\bpricee\b/g, "price")
-    .replace(/\bprize\b/g, "price")
-    .replace(/\bblak\b/g, "black")
-    .replace(/\bblk\b/g, "black")
-    .replace(/\bwhit\b/g, "white")
-    .replace(/\bavai\b/g, "available")
-    .replace(/\bavilable\b/g, "available");
-}
-
-/* =========================
-   FIREBASE
-========================= */
-
-async function getProducts() {
-  try {
-    const response = await fetch(`${DB_URL}/products.json`);
-
-    if (!response.ok) {
-      throw new Error(`Firebase HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (!data) return [];
-
-    return Object.entries(data).map(([id, product]) => ({
-      id,
-      ...product
-    }));
-  } catch (error) {
-    console.error("Firebase product error:", error);
-    return [];
-  }
-}
-
-async function saveOrder(order) {
-  const response = await fetch(`${DB_URL}/orders.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(order)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Order save failed: ${response.status}`);
-  }
-
-  return await response.json();
-}
-
-/* =========================
-   PRODUCT MATCHING
-========================= */
-
-async function findProduct(text) {
-  const products = await getProducts();
-
-  if (!products.length) return null;
-
-  const query = cleanProductText(text);
-
-  let bestProduct = null;
-  let bestScore = 0;
-
-  for (const product of products) {
-    const name = cleanProductText(product.name || "");
-
-    const words = query.split(" ").filter(Boolean);
-
-    let score = 0;
-
-    for (const word of words) {
-      if (word.length < 2) continue;
-
-      if (name.includes(word)) {
-        score += 0.35;
+  for (const qw of qWords) {
+    for (const nw of nameWords) {
+      if (qw === nw) {
+        score += 20;
       } else {
-        const similarityScore = similarity(word, name);
+        const distance = levenshtein(qw, nw);
 
-        if (similarityScore >= 0.65) {
-          score += similarityScore * 0.25;
+        if (distance <= 1) {
+          score += 15;
+        } else if (distance <= 2 && qw.length >= 4) {
+          score += 8;
         }
       }
     }
-
-    if (query.includes(name) || name.includes(query)) {
-      score += 0.5;
-    }
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestProduct = product;
-    }
   }
 
-  return bestScore >= 0.35 ? bestProduct : null;
+  return score;
+}
+
+async function findProducts(query) {
+  const products = await firebaseGet("products");
+
+  if (!products) return [];
+
+  const list = Object.entries(products).map(([id, product]) => ({
+    id,
+    ...product
+  }));
+
+  return list
+    .map(product => ({
+      product,
+      score: productScore(query, product)
+    }))
+    .filter(item => item.score >= 8)
+    .sort((a, b) => b.score - a.score)
+    .map(item => item.product);
 }
 
 /* =========================
    FIXED REPLIES
 ========================= */
 
-const SHOP_INTRO = `True Seller - সবার পছন্দের শপ
+const GREETING =
+`True Seller - সবার পছন্দের শপ
 
 আমাদের শপে ছেলে এবং মেয়ে উভয়ের All Collection পাওয়া যায়।
-
 পোশাক থেকে শুরু করে এক্সেসরিজ পর্যন্ত যা যা লাগে সবকিছুই আমাদের কাছে পাবেন।
-
 লেটেস্ট ফ্যাশন, সেরা কোয়ালিটি এবং সাশ্রয়ী দাম - তিনটাই একসাথে।
-
 নতুন কালেকশন দেখতে এবং অর্ডার করতে আমাদের মেসেজ দিন।`;
 
-const HELP_REPLY = `ভাই 😊 আপনি যে product-এর কথা জানতে চান তার নাম লিখুন।
+const HELP =
+`ভাই/আপু 😊 আপনি চাইলে এভাবে লিখতে পারেন:
 
-যেমন:
-• black tshirt er dam koto
-• kalo tshirt ache?
+• Black tshirt er dam koto
 • blak tshrt price?
-• premium cotton tshirt
+• kalo t shirt koto
+• black tshrt ache?
+• আমি একটা tshirt অর্ডার করতে চাই
 
-আমি আমাদের বর্তমান product list দেখে price ও stock জানিয়ে দেব।`;
+আপনি product-এর নাম লিখলেই আমি available product খুঁজে দেওয়ার চেষ্টা করব।`;
+
+const DELIVERY =
+`🚚 Delivery:
+সারা বাংলাদেশে delivery available।
+আপনার location অনুযায়ী delivery charge জানিয়ে দেওয়া হবে।`;
+
+const PAYMENT =
+`💳 Payment:
+বর্তমানে Cash on Delivery, bKash এবং Nagad payment নেওয়া হয়।`;
 
 function isGreeting(text) {
-  const t = normalize(text);
+  const t = normalizeBanglish(text);
 
   return [
     "hi",
     "hello",
     "hey",
-    "hlw",
-    "hii",
-    "assalamualaikum",
+    "assalamu alaikum",
     "salam",
-    "আসসালামু আলাইকুম",
     "হাই",
-    "হ্যালো"
-  ].includes(t);
+    "হ্যালো",
+    "আসসালামু আলাইকুম"
+  ].some(word => t.includes(word));
 }
 
 function isHelp(text) {
-  const t = normalize(text);
+  const t = normalizeBanglish(text);
 
   return (
-    t === "help" ||
-    t === "কি কি আছে" ||
-    t === "কি আছে" ||
-    t === "product" ||
-    t === "products"
+    t.includes("help") ||
+    t.includes("কি করতে পারি") ||
+    t.includes("কিভাবে") ||
+    t.includes("how to")
   );
 }
 
-function isOrderStart(text) {
-  const t = cleanProductText(text);
+function isDelivery(text) {
+  const t = normalizeBanglish(text);
 
   return (
-    t === "order" ||
-    t === "অর্ডার" ||
-    t.includes("order করতে") ||
-    t.includes("order korbo") ||
-    t.includes("order dibo") ||
-    t.includes("অর্ডার করবো") ||
-    t.includes("অর্ডার দিব")
+    t.includes("delivery") ||
+    t.includes("ডেলিভারি") ||
+    t.includes("courier")
+  );
+}
+
+function isPayment(text) {
+  const t = normalizeBanglish(text);
+
+  return (
+    t.includes("payment") ||
+    t.includes("পেমেন্ট") ||
+    t.includes("bkash") ||
+    t.includes("nagad")
+  );
+}
+
+function isOrderRequest(text) {
+  const t = normalizeBanglish(text);
+
+  return (
+    t.includes("order") ||
+    t.includes("অর্ডার") ||
+    t.includes("নিতে চাই") ||
+    t.includes("কিনতে চাই")
   );
 }
 
 function isYes(text) {
-  const t = normalize(text);
+  const t = normalizeBanglish(text);
 
   return [
     "yes",
@@ -309,24 +302,21 @@ function isYes(text) {
     "okay",
     "confirm",
     "confirmed",
-    "হ্যাঁ",
-    "হ্যা",
     "জি",
-    "ঠিক আছে",
-    "ঠিক"
+    "হ্যাঁ",
+    "ঠিক আছে"
   ].includes(t);
 }
 
 function isNo(text) {
-  const t = normalize(text);
+  const t = normalizeBanglish(text);
 
   return [
     "no",
     "n",
-    "না",
-    "বাদ",
     "cancel",
-    "ক্যানসেল"
+    "না",
+    "বাদ"
   ].includes(t);
 }
 
@@ -334,27 +324,34 @@ function isNo(text) {
    PRODUCT REPLY
 ========================= */
 
-function productReply(product) {
+async function productReply(text, jid) {
+  const products = await findProducts(text);
+
+  if (!products.length) {
+    return null;
+  }
+
+  const product = products[0];
+
   const stock = Number(product.stock || 0);
   const price = Number(product.price || 0);
 
-  let stockText = "";
+  let reply =
+`🛍️ ${product.name}
 
-  if (stock <= 0) {
-    stockText = "❌ এই মুহূর্তে stock শেষ।";
-  } else if (stock <= 3) {
-    stockText = `⚠️ মাত্র ${stock}টি stock আছে।`;
-  } else {
-    stockText = `✅ Stock আছে: ${stock}টি`;
+💰 Price: ৳${price}
+📦 Stock: ${stock > 0 ? `${stock} pcs available` : "Out of stock"}`;
+
+  if (stock > 0) {
+    reply += `
+
+অর্ডার করতে লিখুন: ORDER ${product.name}`;
   }
 
-  return `🛍️ ${product.name}
-
-💰 দাম: ৳${price}
-
-${stockText}
-
-অর্ডার করতে শুধু লিখুন: ORDER`;
+  return {
+    reply,
+    product
+  };
 }
 
 /* =========================
@@ -364,316 +361,131 @@ ${stockText}
 async function handleOrderFlow(jid, text) {
   const state = orderStates.get(jid);
 
-  if (!state) {
-    return false;
-  }
-
-  if (state.step === "product") {
-    const product = await findProduct(text);
-
-    if (!product) {
-      await sock.sendMessage(jid, {
-        text:
-          "ভাই, কোন productটা order করতে চান বুঝতে পারিনি 😅\n\nProduct-এর নাম লিখুন।"
-      });
-
-      return true;
-    }
-
-    const stock = Number(product.stock || 0);
-
-    if (stock <= 0) {
-      await sock.sendMessage(jid, {
-        text: `দুঃখিত ভাই 😔\n\n${product.name} বর্তমানে stock out।`
-      });
-
-      orderStates.delete(jid);
-      return true;
-    }
-
-    orderStates.set(jid, {
-      step: "name",
-      product
-    });
-
-    await sock.sendMessage(jid, {
-      text: `ঠিক আছে ভাই ❤️
-
-🛍️ Product: ${product.name}
-💰 Price: ৳${product.price}
-📦 Stock: ${product.stock}
-
-অর্ডারটি নিতে আপনার নামটি লিখুন।`
-    });
-
-    return true;
-  }
+  if (!state) return null;
 
   if (state.step === "name") {
-    const name = text.trim();
-
-    if (name.length < 2) {
-      await sock.sendMessage(jid, {
-        text: "ভাই, আপনার পুরো নামটা লিখুন।"
-      });
-
-      return true;
-    }
-
-    state.customerName = name;
+    state.customerName = text.trim();
     state.step = "phone";
 
-    await sock.sendMessage(jid, {
-      text: "ধন্যবাদ ❤️\n\nএখন আপনার মোবাইল নম্বরটি দিন।"
-    });
+    orderStates.set(jid, state);
 
-    return true;
+    return "ধন্যবাদ 😊 এখন আপনার ফোন নম্বরটি দিন।";
   }
 
   if (state.step === "phone") {
-    const phone = digitsOnly(text);
-
-    if (phone.length < 10 || phone.length > 15) {
-      await sock.sendMessage(jid, {
-        text: "ভাই, সঠিক মোবাইল নম্বরটি দিন। যেমন: 017XXXXXXXX"
-      });
-
-      return true;
-    }
-
-    state.phone = phone;
+    state.phone = text.trim();
     state.step = "address";
 
-    await sock.sendMessage(jid, {
-      text:
-        "এখন আপনার সম্পূর্ণ delivery address/location লিখুন।\n\nযেমন: গ্রাম, ইউনিয়ন, উপজেলা, জেলা।"
-    });
+    orderStates.set(jid, state);
 
-    return true;
+    return "এখন আপনার সম্পূর্ণ ঠিকানা / location দিন।";
   }
 
   if (state.step === "address") {
-    const address = text.trim();
-
-    if (address.length < 5) {
-      await sock.sendMessage(jid, {
-        text: "ভাই, একটু বিস্তারিত delivery address দিন।"
-      });
-
-      return true;
-    }
-
-    state.address = address;
+    state.address = text.trim();
     state.step = "confirm";
 
-    await sock.sendMessage(jid, {
-      text: `📋 আপনার অর্ডারের তথ্য:
+    orderStates.set(jid, state);
 
-🛍️ Product: ${state.product.name}
-💰 Price: ৳${state.product.price}
+    return `📋 আপনার অর্ডারের তথ্য:
+
+🛍️ Product: ${state.productName}
+💰 Price: ৳${state.price}
+
 👤 Name: ${state.customerName}
-📞 Phone: ${state.phone}
+📱 Phone: ${state.phone}
 📍 Address: ${state.address}
 
-সব তথ্য ঠিক থাকলে লিখুন:
-
-YES
-
-ভুল থাকলে লিখুন:
-
-NO`
-    });
-
-    return true;
+সব তথ্য ঠিক থাকলে শুধু **YES** লিখুন।
+বাতিল করতে **NO** লিখুন।`;
   }
 
   if (state.step === "confirm") {
     if (isNo(text)) {
       orderStates.delete(jid);
-
-      await sock.sendMessage(jid, {
-        text:
-          "ঠিক আছে ভাই 👍 অর্ডারটি বাতিল করা হয়েছে। চাইলে আবার product লিখে নতুন করে order করতে পারেন।"
-      });
-
-      return true;
+      return "ঠিক আছে 😊 অর্ডারটি বাতিল করা হয়েছে।";
     }
 
     if (!isYes(text)) {
-      await sock.sendMessage(jid, {
-        text: "তথ্য ঠিক থাকলে শুধু YES লিখুন। আর বাতিল করতে NO লিখুন।"
-      });
-
-      return true;
+      return "অর্ডার confirm করতে **YES** অথবা বাতিল করতে **NO** লিখুন।";
     }
 
-    try {
-      const order = {
-        productId: state.product.id,
-        productName: state.product.name,
-        price: Number(state.product.price || 0),
-        customerName: state.customerName,
-        phone: state.phone,
-        address: state.address,
-        whatsappJid: jid,
-        status: "pending",
-        createdAt: Date.now()
-      };
+    const order = {
+      productId: state.productId,
+      productName: state.productName,
+      price: state.price,
+      customerName: state.customerName,
+      phone: state.phone,
+      address: state.address,
+      whatsappJid: jid,
+      status: "pending",
+      createdAt: Date.now()
+    };
 
-      await saveOrder(order);
+    try {
+      await firebasePost("orders", order);
 
       orderStates.delete(jid);
 
-      await sock.sendMessage(jid, {
-        text: `✅ আপনার অর্ডারটি সফলভাবে নেওয়া হয়েছে।
+      return `✅ আপনার order successfully নেওয়া হয়েছে।
 
-🛍️ ${order.productName}
-💰 ৳${order.price}
+🛍️ ${state.productName}
+💰 ৳${state.price}
 
-আমাদের পক্ষ থেকে দ্রুত যোগাযোগ করা হবে।
+আমাদের team খুব শিগগিরই আপনার সাথে যোগাযোগ করবে।
 
-ধন্যবাদ True Seller-এর সাথে থাকার জন্য ❤️`
-      });
+ধন্যবাদ True Seller-এর সাথে থাকার জন্য ❤️`;
     } catch (error) {
-      console.error("Order save error:", error);
+      console.error("Firebase order save error:", error);
 
-      await sock.sendMessage(jid, {
-        text:
-          "দুঃখিত ভাই 😔 অর্ডারটি save করতে সমস্যা হয়েছে। একটু পরে আবার চেষ্টা করুন।"
-      });
+      return "দুঃখিত, অর্ডারটি এখন save করা যাচ্ছে না। একটু পরে আবার চেষ্টা করুন।";
     }
-
-    return true;
   }
 
-  return false;
+  return null;
 }
 
 /* =========================
-   MESSAGE HANDLER
+   START ORDER
 ========================= */
 
-async function handleMessage(message) {
-  try {
-    if (!message.message) return;
+async function startOrder(jid, product) {
+  orderStates.set(jid, {
+    step: "name",
+    productId: product.id,
+    productName: product.name,
+    price: Number(product.price || 0),
+    customerName: "",
+    phone: "",
+    address: ""
+  });
 
-    const jid = message.key.remoteJid;
+  return `অবশ্যই 😊
 
-    if (!jid) return;
+🛍️ Product: ${product.name}
+💰 Price: ৳${product.price}
 
-    if (jid.endsWith("@g.us")) return;
-    if (jid === "status@broadcast") return;
-    if (message.key.fromMe) return;
-
-    const text =
-      message.message.conversation ||
-      message.message.extendedTextMessage?.text ||
-      "";
-
-    if (!text.trim()) return;
-
-    console.log(`📩 Message from ${jid}: ${text}`);
-
-    const normalized = normalize(text);
-
-    // Existing order conversation
-    if (orderStates.has(jid)) {
-      await handleOrderFlow(jid, text);
-      return;
-    }
-
-    // Greeting
-    if (isGreeting(text)) {
-      await sock.sendMessage(jid, {
-        text: SHOP_INTRO
-      });
-      return;
-    }
-
-    // Help
-    if (isHelp(text)) {
-      await sock.sendMessage(jid, {
-        text: HELP_REPLY
-      });
-      return;
-    }
-
-    // Start order
-    if (isOrderStart(text)) {
-      orderStates.set(jid, {
-        step: "product"
-      });
-
-      await sock.sendMessage(jid, {
-        text:
-          "অবশ্যই ভাই ❤️\n\nকোন productটি order করতে চান? Product-এর নাম লিখুন।"
-      });
-
-      return;
-    }
-
-    // Product search
-    const product = await findProduct(text);
-
-    if (product) {
-      await sock.sendMessage(jid, {
-        text: productReply(product)
-      });
-
-      return;
-    }
-
-    // Common delivery/payment questions
-    if (
-      normalized.includes("delivery") ||
-      normalized.includes("ডেলিভারি")
-    ) {
-      await sock.sendMessage(jid, {
-        text:
-          "Delivery charge ও delivery time location অনুযায়ী জানানো হবে। আপনার location লিখলে আমরা বিস্তারিত জানাব।"
-      });
-
-      return;
-    }
-
-    if (
-      normalized.includes("payment") ||
-      normalized.includes("পেমেন্ট") ||
-      normalized.includes("bkash") ||
-      normalized.includes("nagad")
-    ) {
-      await sock.sendMessage(jid, {
-        text:
-          "Payment option সম্পর্কে জানতে চাইলে আপনার product ও location জানিয়ে message দিন।"
-      });
-
-      return;
-    }
-
-    await sock.sendMessage(jid, {
-      text:
-        "আপনার প্রশ্নটা হয়তো আমি বুঝিনি 😅\n\nProduct-এর নাম লিখুন, যেমন:\nblack tshirt er dam koto\n\nঅথবা HELP লিখুন।"
-    });
-  } catch (error) {
-    console.error("Message handler error:", error);
-  }
+অর্ডার শুরু করতে আপনার **নামটি** লিখুন।`;
 }
 
 /* =========================
-   WHATSAPP CONNECTION
+   WHATSAPP
 ========================= */
 
-async function startWhatsApp() {
+async function connectWhatsApp() {
+  if (reconnecting) return;
+
+  reconnecting = true;
+
   try {
     const { state, saveCreds } =
       await useMultiFileAuthState("./auth_info_baileys");
-
-    pairingRequested = false;
 
     sock = makeWASocket({
       auth: state,
       logger,
       browser: Browsers.windows("Chrome"),
+      printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false
     });
@@ -691,38 +503,38 @@ async function startWhatsApp() {
         `📡 WhatsApp connection status: ${connection || "unknown"}`
       );
 
-      /*
-       * Pairing code must be requested while the socket
-       * is connecting / QR event has arrived.
-       */
+      if (qr) {
+        console.log(
+          "ℹ️ QR event received. Pairing-code login is being used."
+        );
+      }
+
+      // Pairing code
       if (
         !state.creds.registered &&
+        PAIRING_NUMBER &&
         !pairingRequested &&
-        (connection === "connecting" || !!qr)
+        (connection === "connecting" || qr)
       ) {
         pairingRequested = true;
 
         try {
-          if (!PAIRING_NUMBER) {
-            console.error(
-              "❌ PAIRING_NUMBER is missing from Render Environment Variables."
-            );
+          // Give the socket a moment to finish initial handshake.
+          await new Promise(resolve =>
+            setTimeout(resolve, 2500)
+          );
+
+          if (state.creds.registered) {
+            console.log("✅ Already registered.");
             return;
           }
 
           console.log(
-            `📱 Pairing number configured: ${PAIRING_NUMBER.slice(
-              0,
-              3
-            )}*******`
+            "⏳ Requesting WhatsApp pairing code..."
           );
 
-          // Small delay gives the socket time to settle.
-          await new Promise((resolve) => setTimeout(resolve, 1500));
-
-          const code = await sock.requestPairingCode(
-            PAIRING_NUMBER
-          );
+          const code =
+            await sock.requestPairingCode(PAIRING_NUMBER);
 
           console.log("");
           console.log("======================================");
@@ -751,54 +563,190 @@ async function startWhatsApp() {
         console.log("✅ WHATSAPP CONNECTED SUCCESSFULLY");
         console.log("======================================");
         console.log("");
+
+        pairingRequested = false;
+        reconnecting = false;
       }
 
       if (connection === "close") {
+        reconnecting = false;
+
         const statusCode =
-          new Boom(lastDisconnect?.error)?.output?.statusCode;
+          lastDisconnect?.error?.output?.statusCode;
+
+        const loggedOut =
+          statusCode === DisconnectReason.loggedOut;
 
         console.log(
-          `⚠️ WhatsApp connection closed. Status: ${statusCode}`
+          `❌ WhatsApp connection closed. Status: ${statusCode || "unknown"}`
         );
 
-        if (statusCode === DisconnectReason.loggedOut) {
+        if (loggedOut) {
           console.log(
-            "❌ WhatsApp logged out. Fresh pairing is required."
+            "🚪 WhatsApp logged out. Delete auth_info_baileys and pair again."
           );
-          sock = null;
           return;
         }
 
-        /*
-         * WhatsApp/Baileys may intentionally close the old socket
-         * with restartRequired after pairing. Recreate it.
-         */
-        console.log("🔄 Restarting WhatsApp connection...");
+        console.log(
+          "🔄 Reconnecting to WhatsApp in 5 seconds..."
+        );
 
-        sock = null;
+        pairingRequested = false;
 
         setTimeout(() => {
-          startWhatsApp();
-        }, 3000);
-      }
-
-      if (qr) {
-        console.log(
-          "ℹ️ QR event received. Pairing-code login is being used."
-        );
+          connectWhatsApp().catch(console.error);
+        }, 5000);
       }
     });
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
-      for (const message of messages) {
-        await handleMessage(message);
+      try {
+        const msg = messages?.[0];
+
+        if (!msg?.message) return;
+        if (msg.key.fromMe) return;
+        if (msg.key.remoteJid?.endsWith("@g.us")) return;
+        if (msg.key.remoteJid === "status@broadcast") return;
+
+        const jid = msg.key.remoteJid;
+
+        const text =
+          msg.message.conversation ||
+          msg.message.extendedTextMessage?.text ||
+          "";
+
+        if (!text.trim()) return;
+
+        console.log(
+          `📩 Message from ${jid}: ${text}`
+        );
+
+        // Existing order flow
+        const flowReply =
+          await handleOrderFlow(jid, text);
+
+        if (flowReply) {
+          await sock.sendMessage(jid, {
+            text: flowReply
+          });
+
+          return;
+        }
+
+        // Greeting
+        if (isGreeting(text)) {
+          await sock.sendMessage(jid, {
+            text: GREETING
+          });
+
+          return;
+        }
+
+        // Help
+        if (isHelp(text)) {
+          await sock.sendMessage(jid, {
+            text: HELP
+          });
+
+          return;
+        }
+
+        // Delivery
+        if (isDelivery(text)) {
+          await sock.sendMessage(jid, {
+            text: DELIVERY
+          });
+
+          return;
+        }
+
+        // Payment
+        if (isPayment(text)) {
+          await sock.sendMessage(jid, {
+            text: PAYMENT
+          });
+
+          return;
+        }
+
+        // ORDER product
+        if (isOrderRequest(text)) {
+          const cleaned = text
+            .replace(/order/gi, "")
+            .replace(/অর্ডার/g, "")
+            .trim();
+
+          if (cleaned) {
+            const result =
+              await productReply(cleaned, jid);
+
+            if (result?.product) {
+              if (Number(result.product.stock || 0) <= 0) {
+                await sock.sendMessage(jid, {
+                  text: `দুঃখিত 😔 ${result.product.name} বর্তমানে stock out।`
+                });
+
+                return;
+              }
+
+              const reply =
+                await startOrder(
+                  jid,
+                  result.product
+                );
+
+              await sock.sendMessage(jid, {
+                text: reply
+              });
+
+              return;
+            }
+          }
+
+          await sock.sendMessage(jid, {
+            text: "কোন productটি order করতে চান? Product-এর নাম লিখুন।"
+          });
+
+          return;
+        }
+
+        // Product search
+        const result =
+          await productReply(text, jid);
+
+        if (result?.product) {
+          await sock.sendMessage(jid, {
+            text: result.reply
+          });
+
+          return;
+        }
+
+        // Fallback
+        await sock.sendMessage(jid, {
+          text:
+            "দুঃখিত, আপনার প্রশ্নটা হয়তো আমি বুঝিনি 😅\n\nProduct-এর নাম বা `help` লিখে আবার চেষ্টা করুন।"
+        });
+
+      } catch (error) {
+        console.error(
+          "❌ Message handling error:",
+          error
+        );
       }
     });
+
   } catch (error) {
-    console.error("❌ WhatsApp startup error:", error);
+    reconnecting = false;
+
+    console.error(
+      "❌ WhatsApp startup error:",
+      error
+    );
 
     setTimeout(() => {
-      startWhatsApp();
+      connectWhatsApp().catch(console.error);
     }, 5000);
   }
 }
@@ -807,4 +755,22 @@ async function startWhatsApp() {
    START
 ========================= */
 
-startWhatsApp();
+console.log("🚀 Starting True Seller WhatsApp Bot...");
+
+if (!FIREBASE_DB_URL) {
+  console.warn(
+    "⚠️ FIREBASE_DB_URL is not configured."
+  );
+}
+
+if (!PAIRING_NUMBER) {
+  console.warn(
+    "⚠️ PAIRING_NUMBER is not configured."
+  );
+} else {
+  console.log(
+    `📱 Pairing number configured: ${PAIRING_NUMBER.slice(0, 3)}*******`
+  );
+}
+
+connectWhatsApp().catch(console.error);
