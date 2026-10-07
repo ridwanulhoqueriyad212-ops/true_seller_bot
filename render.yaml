@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: true-seller-whatsapp-bot
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: FIREBASE_DB_URL
+        sync: false
+      - key: PAIRING_NUMBER
+        sync: false
